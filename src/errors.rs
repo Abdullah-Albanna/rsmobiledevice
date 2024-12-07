@@ -1,6 +1,10 @@
+use std::sync::mpsc::SendError;
+
 use plist_plus::error::PlistError;
 use rusty_libimobiledevice::error::{AfcError, IdeviceError, InstProxyError, LockdowndError};
 use thiserror::Error;
+
+use crate::device_syslog::LoggerCommand;
 
 #[derive(Debug, Error)]
 pub enum DeviceClientError {
@@ -15,6 +19,12 @@ pub enum DeviceClientError {
 
     #[error("AFC Client Error: {0}")]
     AFCClientError(#[from] AfcError),
+}
+
+#[derive(Debug, Error)]
+pub enum DeviceSysLogError {
+    #[error("Couldn't send a message to the channel, maybe it's closed?, error: {0}")]
+    SendError(#[from] SendError<LoggerCommand>),
 }
 
 #[derive(Debug, Error)]

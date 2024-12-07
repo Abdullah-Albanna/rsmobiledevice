@@ -14,5 +14,4 @@ plist_plus = "0.2.6"
 regex = "1.11.1"
 rusty_libimobiledevice = "0.2.2"
 thiserror = "2.0.3"
-tokio = { version = "1.42.0", features = ["full"] }
 zip = "2.2.1"
