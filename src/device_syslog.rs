@@ -2,13 +2,92 @@ use crate::errors::DeviceSysLogError;
 use crate::{device::DeviceClient, devices::SingleDevice};
 use regex::Regex;
 use rusty_libimobiledevice::service::ServiceClient;
+use std::collections::HashSet;
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::{fmt, fs};
+
+const QUITE: [&str; 75] = [
+    "CircleJoinRequested",
+    "CommCenter",
+    "HeuristicInterpreter",
+    "MobileMail",
+    "PowerUIAgent",
+    "ProtectedCloudKeySyncing",
+    "SpringBoard",
+    "UserEventAgent",
+    "WirelessRadioManagerd",
+    "accessoryd",
+    "accountsd",
+    "aggregated",
+    "analyticsd",
+    "appstored",
+    "apsd",
+    "assetsd",
+    "assistant_service",
+    "backboardd",
+    "biometrickitd",
+    "bluetoothd",
+    "calaccessd",
+    "callservicesd",
+    "cloudd",
+    "com.apple.Safari.SafeBrowsing.Service",
+    "contextstored",
+    "corecaptured",
+    "coreduetd",
+    "corespeechd",
+    "cdpd",
+    "dasd",
+    "dataaccessd",
+    "distnoted",
+    "dprivacyd",
+    "duetexpertd",
+    "findmydeviced",
+    "fmfd",
+    "fmflocatord",
+    "gpsd",
+    "healthd",
+    "homed",
+    "identityservicesd",
+    "imagent",
+    "itunescloudd",
+    "itunesstored",
+    "kernel",
+    "locationd",
+    "maild",
+    "mDNSResponder",
+    "mediaremoted",
+    "mediaserverd",
+    "mobileassetd",
+    "nanoregistryd",
+    "nanotimekitcompaniond",
+    "navd",
+    "nsurlsessiond",
+    "passd",
+    "pasted",
+    "photoanalysisd",
+    "powerd",
+    "powerlogHelperd",
+    "ptpd",
+    "rapportd",
+    "remindd",
+    "routined",
+    "runningboardd",
+    "searchd",
+    "sharingd",
+    "suggestd",
+    "symptomsd",
+    "timed",
+    "thermalmonitord",
+    "useractivityd",
+    "vmd",
+    "wifid",
+    "wirelessproxd",
+];
 
 /// Enum for controlling logging behavior
 #[derive(Debug, Clone)]
@@ -17,9 +96,90 @@ pub enum LoggerCommand {
     StopLogging,
 }
 
+// Enum for Log Filters
+#[derive(Debug, Clone)]
+pub enum LogFilter {
+    Match(String),
+    Trigger(String),
+    Untrigger(String),
+    Process(HashSet<String>),
+    Exclude(HashSet<String>),
+    Quiet,
+    KernelOnly,
+    NoKernel,
+    Nothing,
+}
+
+impl LogFilter {
+    // Method to apply filters to a log line
+    pub fn apply_and_is_okay_to_continue(&self, logs_data: &mut LogsData) -> bool {
+        match self {
+            LogFilter::Match(pattern) => {
+                let message = logs_data.message;
+                if !message.contains(pattern) {
+                    *logs_data = LogsData::default();
+                }
+                true
+            }
+            LogFilter::Trigger(_) => todo!(),
+            LogFilter::Untrigger(pattern) => {
+                let message = logs_data.message;
+                if !message.contains(pattern) {
+                    return true;
+                }
+                false
+            }
+            LogFilter::Process(processes) => {
+                let process = logs_data.process;
+                for proc in processes {
+                    if !process.contains(proc) {
+                        *logs_data = LogsData::default();
+                        break;
+                    }
+                }
+                true
+            }
+            LogFilter::Exclude(exclude_processes) => {
+                let process = logs_data.process;
+                for exproc in exclude_processes {
+                    if process.contains(exproc) {
+                        *logs_data = LogsData::default();
+                        break;
+                    }
+                }
+                true
+            }
+            LogFilter::Quiet => {
+                let process = logs_data.process;
+
+                if QUITE.contains(&process) {
+                    *logs_data = LogsData::default();
+                }
+                true
+            }
+            LogFilter::KernelOnly => {
+                let process = logs_data.process;
+
+                if !process.contains("kernel") {
+                    *logs_data = LogsData::default();
+                }
+                true
+            }
+            LogFilter::NoKernel => {
+                let process = logs_data.process;
+
+                if process.contains("kernel") {
+                    *logs_data = LogsData::default();
+                }
+                true
+            }
+            LogFilter::Nothing => true,
+        }
+    }
+}
 /// Struct to store parsed log data
-#[derive(Debug, Default)]
-struct LogsData<'a> {
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LogsData<'a> {
     date: &'a str,
     device: &'a str,
     process: &'a str,
@@ -68,10 +228,12 @@ fn process_logs(line: &str) -> LogsData<'_> {
     process_log_line(line, &log_regex).unwrap_or_default()
 }
 
+#[derive(Debug)]
 pub struct DeviceSysLog<T> {
     devices: Arc<DeviceClient<T>>,
     sender: mpsc::Sender<LoggerCommand>,
     receiver: Arc<Mutex<mpsc::Receiver<LoggerCommand>>>,
+    filter: LogFilter,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -82,6 +244,7 @@ impl<T> DeviceSysLog<T> {
             devices: Arc::new(devices),
             sender: tx,
             receiver: Arc::new(Mutex::new(rx)),
+            filter: LogFilter::Nothing,
             _phantom: std::marker::PhantomData::<T>,
         }
     }
@@ -95,6 +258,7 @@ impl DeviceSysLog<SingleDevice> {
     {
         let devices_clone = Arc::clone(&self.devices);
         let receiver_clone = Arc::clone(&self.receiver);
+        let filter_clone = Arc::new(self.filter.clone());
 
         // Spawn a new thread to handle logging at the background
         thread::spawn(move || {
@@ -129,7 +293,17 @@ impl DeviceSysLog<SingleDevice> {
 
                             for line in logs_raw_string.split_terminator('\n') {
                                 let line = line.trim_matches('\0'); // Remove null characters
-                                callback(process_logs(line));
+                                let mut log_data = process_logs(line);
+
+                                if !filter_clone.apply_and_is_okay_to_continue(&mut log_data) {
+                                    break;
+                                }
+
+                                if log_data == LogsData::default() {
+                                    continue;
+                                }
+
+                                callback(log_data);
                             }
                         }
                         Err(err) => {
@@ -141,6 +315,10 @@ impl DeviceSysLog<SingleDevice> {
                 }
             }
         });
+    }
+
+    pub fn set_filter(&mut self, filter: LogFilter) {
+        self.filter = filter;
     }
 
     pub fn log_to_stdout(&self) {
@@ -189,13 +367,5 @@ impl DeviceSysLog<SingleDevice> {
 
     pub fn stop_logging(&self) {
         self.sender.send(LoggerCommand::StopLogging).unwrap();
-    }
-}
-
-impl fmt::Debug for DeviceSysLog<SingleDevice> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceSysLog")
-            .field("devices", &self.devices)
-            .finish()
     }
 }
