@@ -15,18 +15,25 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     marker::PhantomData,
     path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use plist_plus::Plist;
 use rusty_libimobiledevice::services::{
     afc::{AfcClient, AfcFileMode},
-    instproxy::InstProxyClient,
+    instproxy::{CommandPlist, InstProxyClient, StatusPlist},
 };
 use zip::ZipArchive;
 
 pub(crate) mod errors;
 
-use crate::{device::DeviceClient, devices_collection::SingleDevice, errors::DeviceInstallerError};
+use crate::{
+    device::DeviceClient, devices_collection::SingleDevice, errors::DeviceInstallerError,
+    RecursiveFind,
+};
 
 const PKG_PATH: &str = "PublicStaging"; // The remote directory path where packages will be uploaded
 const IPCC_REMOTE_FOLDER: &str = "rsmobiledevice.ipcc"; // Folder for IPCC packages. IPCC packages
@@ -86,7 +93,36 @@ impl DeviceInstaller<'_, SingleDevice> {
 
         let mut cursor = Cursor::new(file_content);
 
-        self._install_package(&mut cursor, options)
+        self._install_package(&mut cursor, options, None)
+    }
+
+    /// Installs a package from a given file path with a callback of the progress.
+    ///
+    /// # Parameters
+    /// - `package_path`: Path to the package to be installed.
+    /// - `options`: Optional installation options.
+    ///
+    /// This method reads the package from the provided path, determines its type, uploads it to the device, and installs it.
+    pub fn install_from_path_with_callback<S, F>(
+        &self,
+        package_path: &S,
+        options: Option<HashMap<&str, &str>>,
+        callback: F,
+    ) -> Result<(), DeviceInstallerError>
+    where
+        S: AsRef<OsStr> + ?Sized,
+        F: Fn(CommandPlist, StatusPlist) + Send + Sync + 'static,
+    {
+        self.device.check_connected::<DeviceInstallerError>()?;
+
+        let mut file = std::fs::File::open(Path::new(package_path.as_ref()))?;
+        let mut file_content = Vec::new();
+
+        file.read_to_end(&mut file_content).unwrap_or_default();
+
+        let mut cursor = Cursor::new(file_content);
+
+        self._install_package(&mut cursor, options, Some(Box::new(callback)))
     }
 
     /// Installs a package from a reader (e.g., bytes from memory or a stream).
@@ -104,13 +140,36 @@ impl DeviceInstaller<'_, SingleDevice> {
         options: Option<HashMap<&str, &str>>,
     ) -> Result<(), DeviceInstallerError> {
         self.device.check_connected::<DeviceInstallerError>()?;
-        self._install_package(package_file, options)
+        self._install_package(package_file, options, None)
+    }
+
+    /// Installs a package from a reader (e.g., bytes from memory or a stream) with a progress callback.
+    ///
+    /// It must be mutable as it will set the cursor to the beginning due to multiple reads
+    ///
+    /// # Parameters
+    /// - `package_file`: A reader containing the package data.
+    /// - `options`: Optional installation options.
+    ///
+    /// This method works similarly to `install_from_path`, but it reads the package directly from a reader.
+    pub fn install_from_reader_with_callback<T: Read + Seek, F>(
+        &self,
+        package_file: &mut T,
+        options: Option<HashMap<&str, &str>>,
+        callback: F,
+    ) -> Result<(), DeviceInstallerError>
+    where
+        F: Fn(CommandPlist, StatusPlist) + Send + Sync + 'static,
+    {
+        self.device.check_connected::<DeviceInstallerError>()?;
+        self._install_package(package_file, options, Some(Box::new(callback)))
     }
 
     fn _install_package<T: Read + Seek>(
         &self,
         file: &mut T,
         options: Option<HashMap<&str, &str>>,
+        callback: Option<Box<dyn Fn(CommandPlist, StatusPlist) + Send + Sync>>,
     ) -> Result<(), DeviceInstallerError> {
         let device = self.device.get_device();
         let afc_client = self.device.get_afc_client::<DeviceInstallerError>()?;
@@ -129,28 +188,52 @@ impl DeviceInstaller<'_, SingleDevice> {
 
         self.upload_package(&afc_client, &package_type, file)?;
 
-        let installation_client = device.new_instproxy_client("rsmobiledevice-deviceinstaller")?;
+        let installation_client =
+            Arc::new(device.new_instproxy_client("rsmobiledevice-deviceinstaller")?);
 
-        match package_type {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = Arc::clone(&completed);
+
+        let remote_packages_path = match package_type {
             PackageType::Ipcc => {
                 package_options.dict_set_item("PackageType", "CarrierBundle".into())?;
-                installation_client.install(
-                    format!("/{}/{}", PKG_PATH, IPCC_REMOTE_FOLDER),
-                    Some(package_options),
-                )?;
+                format!("/{}/{}", PKG_PATH, IPCC_REMOTE_FOLDER)
             }
             PackageType::Ipa => {
-                let bundle_id = self.get_bundle_id(file)?; // Only ipa packages need to
-                                                           // include the bundle id to the installation options
+                let bundle_id = self.get_bundle_id(file)?;
                 package_options.dict_set_item("CFBundleIdentifier", bundle_id.into())?;
-
-                installation_client.install(
-                    format!("/{}/{}", PKG_PATH, IPA_REMOTE_FILE),
-                    Some(package_options),
-                )?;
+                format!("/{}/{}", PKG_PATH, IPA_REMOTE_FILE)
             }
             PackageType::Unknown => return Err(DeviceInstallerError::UnknownPackage),
         };
+
+        installation_client.install_with_callback(
+            remote_packages_path,
+            Some(package_options),
+            Some(Box::new(move |cmd: CommandPlist, status: StatusPlist| {
+                if let Some(ref cb) = callback {
+                    // this would keep the client in scope and thus continue with the callback
+                    //
+                    // we would only stop if there is a key named `Error`
+                    // or the `PercentComplete` is `100`
+                    // or the `Status` is `Complete` ( for ipcc packages )
+                    let condition = status.rfind("Error").is_some()
+                        || status.rfind("PercentComplete").is_some_and(|n| &n == "100")
+                        || status.rfind("Status").is_some_and(|s| &s == "Complete");
+
+                    if condition {
+                        completed_clone.store(true, Ordering::SeqCst);
+                    }
+
+                    cb(cmd, status); // Execute the callback
+                }
+            })),
+        )?;
+
+        // Wait for the callback to signal completion
+        while !completed.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         Ok(())
     }

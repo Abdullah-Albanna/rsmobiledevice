@@ -12,6 +12,6 @@ keywords = ["libimobiledevice", "ios", "lockdown", "ipa", "ipcc", "mobiledevice"
 crossbeam-channel = "0.5.13"
 plist_plus = "0.2.6"
 regex = "1.11.1"
-rusty_libimobiledevice = { git = "https://github.com/Abdullah-Albanna/modified_rusty_libimobiledevice" }
+rusty_libimobiledevice = { git = "https://github.com/Abdullah-Albanna/modified_rusty_libimobiledevice", rev = "f7fbbd8" }
 thiserror = "2.0.3"
 zip = "2.2.1"
